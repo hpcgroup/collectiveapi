@@ -70,7 +70,9 @@ class MSCCLSendStep(MSCCLStep):
         tb_xml_node: ElementTree.Element,
         step_id: int, 
         node_id: int,
-        comm_data_size_bytes: int
+        comm_data_size_bytes: int,
+        protocol: str,
+        comm_delay_ns: int
     ) -> None:
         tb_id = tb_xml_node.attrib['id']
         self.dst = int(tb_xml_node.attrib['send'])
@@ -88,6 +90,10 @@ class MSCCLSendStep(MSCCLStep):
                                     uint64_val=self.dst))
         node.attr.append(ChakraAttr(name="comm_tag",
                                     uint64_val=self.tag))
+        node.attr.append(ChakraAttr(name="comm_protocol",
+                                    string_val=protocol))
+        node.attr.append(ChakraAttr(name="comm_delay_ns",
+                                    uint64_val=comm_delay_ns))
         self.node = node
 
 class MSCCLReceiveStep(MSCCLStep):
@@ -96,7 +102,8 @@ class MSCCLReceiveStep(MSCCLStep):
         tb_xml_node: ElementTree.Element,
         step_id: int, 
         node_id: int,
-        comm_data_size_bytes: int
+        comm_data_size_bytes: int,
+        protocol: str
     ) -> None:
         tb_id = tb_xml_node.attrib['id']
         self.src = int(tb_xml_node.attrib['recv'])
@@ -114,6 +121,10 @@ class MSCCLReceiveStep(MSCCLStep):
                                     uint64_val=self.src))
         node.attr.append(ChakraAttr(name="comm_tag",
                                     uint64_val=self.tag))
+        node.attr.append(ChakraAttr(name="comm_protocol",
+                                    string_val=protocol))
+        node.attr.append(ChakraAttr(name="comm_delay_ns",
+                                    uint64_val=0))
         self.node = node
 
 class MSCCLReceiveReduceComputeStep(MSCCLStep):
@@ -123,7 +134,9 @@ class MSCCLReceiveReduceComputeStep(MSCCLStep):
         step_id: int, 
         recv_node_id: int,
         comp_node_id: int,
-        comm_data_size_bytes: int
+        comm_data_size_bytes: int,
+        comp_data_size_bytes: int,
+        protocol: str
     ) -> None:
         tb_id = tb_xml_node.attrib['id']
         self.src = int(tb_xml_node.attrib['recv'])
@@ -141,13 +154,17 @@ class MSCCLReceiveReduceComputeStep(MSCCLStep):
                                     uint64_val=self.src))
         recv_node.attr.append(ChakraAttr(name="comm_tag",
                                     uint64_val=self.tag))
+        recv_node.attr.append(ChakraAttr(name="comm_protocol",
+                                    string_val=protocol))
+        recv_node.attr.append(ChakraAttr(name="comm_delay_ns",
+                                    uint64_val=0))
         self.recv_node = recv_node
 
         comp_node = Node()
         comp_node.id = comp_node_id
         comp_node.name = f"COMP_NODE_tb{tb_id}_step{step_id}"
         comp_node.type = COMP_NODE
-        comp_node.duration_micros = calculate_comp_time(comm_data_size_bytes)
+        comp_node.duration_micros = calculate_comp_time(comp_data_size_bytes)
         comp_node.data_deps.append(recv_node.id)
         self.comp_node = comp_node
 
@@ -179,6 +196,12 @@ class MSCCL2ChakraConverter:
         input_filename: str,
         output_filename: str,
         coll_size: int,
+        ll_size_factor: float,
+        simple_latency_factor: float,
+        gpus_per_node: int,
+        intra_latency_ns: float,
+        inter_latency_ns: float,
+        protocol_override: str | None,
         logger: logging.Logger
     ) -> None:
         self.input_filename = input_filename
@@ -186,7 +209,29 @@ class MSCCL2ChakraConverter:
         self.logger = logger
         self.next_node_id = 0
         self.collective_size = coll_size #Bytes
+        self.ll_size_factor = ll_size_factor
+        self.simple_latency_factor = simple_latency_factor
+        self.gpus_per_node = gpus_per_node
+        self.intra_latency_ns = intra_latency_ns
+        self.inter_latency_ns = inter_latency_ns
+        self.protocol_override = protocol_override
         print('collective_size', self.collective_size)
+
+    def effective_comm_size(self, protocol: str, payload_size_bytes: int) -> int:
+        if protocol == "LL":
+            return int(payload_size_bytes * self.ll_size_factor)
+        return payload_size_bytes
+
+    def protocol_send_delay_ns(self, protocol: str, src_rank: int, dst_rank: int) -> int:
+        if protocol != "Simple":
+            return 0
+
+        link_latency_ns = self.intra_latency_ns
+        if src_rank // self.gpus_per_node != dst_rank // self.gpus_per_node:
+            link_latency_ns = self.inter_latency_ns
+
+        extra_latency_ns = max(0.0, self.simple_latency_factor - 1.0) * link_latency_ns
+        return int(extra_latency_ns)
 
     # Creates the global metadata info that is added to the start of all ET files.
     def create_global_metadata(self):
@@ -227,6 +272,7 @@ class MSCCL2ChakraConverter:
         step_map = {}
         tree = ElementTree.parse(self.input_filename)
         root = tree.getroot()
+        protocol = self.protocol_override or root.attrib.get("proto", "Simple")
 
         # Read the XML file and create ET Trace nodes. 
         for gpu in root.findall('gpu'):
@@ -248,17 +294,24 @@ class MSCCL2ChakraConverter:
                 for step in tb.findall('step'):
                     step_id = int(step.attrib['s'])
                     chunk_cnt = int(step.attrib['cnt'])
+                    payload_size = chunk_size * chunk_cnt
+                    comm_size = self.effective_comm_size(protocol, payload_size)
                     step_map[gpu_id][tb_id][step_id] = step
                     et_node_id = self.get_et_node_id()
                     if step.attrib['type'] == "s":
-                        node = MSCCLSendStep(tb, step_id, et_node_id, chunk_size * chunk_cnt)
+                        dst_rank = int(tb.attrib['send'])
+                        comm_delay_ns = self.protocol_send_delay_ns(protocol, gpu_id, dst_rank)
+                        node = MSCCLSendStep(
+                            tb, step_id, et_node_id, comm_size, protocol, comm_delay_ns)
                         node_map[gpu_id][tb_id][step_id] = node
                     elif step.attrib['type'] == "r":
-                        node = MSCCLReceiveStep(tb, step_id, et_node_id,  chunk_size * chunk_cnt)
+                        node = MSCCLReceiveStep(tb, step_id, et_node_id, comm_size, protocol)
                         node_map[gpu_id][tb_id][step_id] = node
                     elif step.attrib['type'] == "rrc":
                         comp_et_node_id = self.get_et_node_id()
-                        node = MSCCLReceiveReduceComputeStep(tb, step_id, et_node_id, comp_et_node_id, chunk_size * chunk_cnt)
+                        node = MSCCLReceiveReduceComputeStep(
+                            tb, step_id, et_node_id, comp_et_node_id,
+                            comm_size, payload_size, protocol)
                         node_map[gpu_id][tb_id][step_id] = node
                     elif step.attrib['type'] == "nop":
                         node = MSCCLNopStep()
@@ -299,7 +352,7 @@ class MSCCL2ChakraConverter:
                             if prev_step_id < 0:
                                 break
                             prev_node = node_map[gpu_id][tb_id][prev_step_id]
-                        
+
                         if type(prev_node) is not MSCCLNopStep:
                             et_node.add_parent(prev_node)
         

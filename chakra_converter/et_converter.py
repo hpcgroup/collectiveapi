@@ -59,6 +59,37 @@ def main() -> None:
         type=int,
         default=1048576,
         help="Collective size in Bytes")
+    parser.add_argument(
+        "--ll_size_factor",
+        type=float,
+        default=2.0,
+        help="Effective Chakra comm_size multiplier for MSCCL LL protocol")
+    parser.add_argument(
+        "--simple_latency_factor",
+        type=float,
+        default=1.5,
+        help="Link-latency multiplier for MSCCL Simple protocol")
+    parser.add_argument(
+        "--gpus_per_node",
+        type=int,
+        default=4,
+        help="Number of GPUs per node for intra/inter-node latency classification")
+    parser.add_argument(
+        "--intra_latency_ns",
+        type=float,
+        default=4000.0,
+        help="Intra-node link latency in ns")
+    parser.add_argument(
+        "--inter_latency_ns",
+        type=float,
+        default=7200.0,
+        help="Inter-node link latency in ns")
+    parser.add_argument(
+        "--protocol_override",
+        type=str,
+        choices=["Simple", "LL", "LL128"],
+        default=None,
+        help="Override the MSCCL XML root proto field for simulation")
     args = parser.parse_args()
 
     logger = get_logger(args.log_filename)
@@ -67,9 +98,15 @@ def main() -> None:
     try:
         if args.input_type == "msccl":
             converter = MSCCL2ChakraConverter(
-                args.input_filename, 
-                args.output_filename, 
+                args.input_filename,
+                args.output_filename,
                 args.coll_size,
+                args.ll_size_factor,
+                args.simple_latency_factor,
+                args.gpus_per_node,
+                args.intra_latency_ns,
+                args.inter_latency_ns,
+                args.protocol_override,
                 logger)
             converter.convert()
         else:
