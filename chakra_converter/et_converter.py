@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import logging
 import sys
 import traceback
@@ -90,6 +91,35 @@ def main() -> None:
         choices=["Simple", "LL", "LL128"],
         default=None,
         help="Override the MSCCL XML root proto field for simulation")
+    parser.add_argument(
+        "--msccl_stripe_calls",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="1: a send that stands for several MSCCL stripe calls pays the per-message cost "
+             "once per call (see msccl_engine_model.py). 0: unchanged traces")
+    parser.add_argument(
+        "--msccl_conn_tags",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="1: tag = channel + 64 * connIndex, the MSCCL runtime's connection slot "
+             "(see msccl_engine_model.py). 0: tag = channel")
+    parser.add_argument(
+        "--msccl_stripe_runtime",
+        type=str,
+        choices=["v2b", "v3"],
+        default="v2b",
+        help="Stripe rules of the target MSCCL runtime (see msccl_engine_model.py, part 3). "
+             "v2b: unchanged traces. v3: runtime_v3's per-launch stripe count and, with stage5 stripe_passes, "
+             "its per-stripe dependency flags")
+    parser.add_argument(
+        "--stage3_json",
+        type=str,
+        default="",
+        help="Stage 3 measured terms as a JSON object of converter keyword arguments "
+             "(net_hop_ns, nvl_hop_ns, call_cost_ns, ll_net_size_factor, ll_conn_GBps, "
+             "net_link_GBps, proxy_chan_ns, proxy_chan_scope, stage4). Empty: none (Stage 1 traces)")
     args = parser.parse_args()
 
     logger = get_logger(args.log_filename)
@@ -107,7 +137,11 @@ def main() -> None:
                 args.intra_latency_ns,
                 args.inter_latency_ns,
                 args.protocol_override,
-                logger)
+                logger,
+                msccl_stripe_calls=bool(args.msccl_stripe_calls),
+                msccl_conn_tags=bool(args.msccl_conn_tags),
+                msccl_stripe_runtime=args.msccl_stripe_runtime,
+                **(json.loads(args.stage3_json) if args.stage3_json else {}))
             converter.convert()
         else:
             logger.error(f"{args.input_type} unsupported")
